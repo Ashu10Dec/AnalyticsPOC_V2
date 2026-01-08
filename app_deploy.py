@@ -7,7 +7,7 @@ from usage_tracker import UsageTracker
 
 # --- Configuration ---
 app = Flask(__name__)
-JSON_DB_FILE = "activity.json"
+JSON_DB_FILE = "Activity.json"
 HISTORY_FILE = "question_history.json"
 MODEL = "gpt-4.1-mini"
 
