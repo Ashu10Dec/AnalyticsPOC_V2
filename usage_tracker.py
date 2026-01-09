@@ -1,5 +1,3 @@
-# usage_tracker.py
-
 from datetime import datetime
 
 # ---- Model pricing (USD per 1K tokens) ----
@@ -20,15 +18,20 @@ class UsageTracker:
         self.started_at = datetime.utcnow()
 
     def record(self, response, model: str, stage: str):
+        """
+        Records the token usage from an OpenAI response object.
+        """
         usage = getattr(response, "usage", None)
         if not usage:
             return
 
+        # FIXED: OpenAI uses 'prompt_tokens' and 'completion_tokens'
+        # We map them to 'input_tokens' and 'output_tokens' for our internal consistency
         self.calls.append({
             "stage": stage,
             "model": model,
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
+            "input_tokens": usage.prompt_tokens,      # Was usage.input_tokens (Error source)
+            "output_tokens": usage.completion_tokens, # Was usage.output_tokens
             "total_tokens": usage.total_tokens
         })
 
@@ -36,17 +39,16 @@ class UsageTracker:
         pricing = MODEL_PRICING.get(call["model"])
         if not pricing:
             return 0.0
-
+        
         input_cost = (call["input_tokens"] / 1000) * pricing["input"]
         output_cost = (call["output_tokens"] / 1000) * pricing["output"]
-
+        
         return round(input_cost + output_cost, 6)
 
     def summary(self):
         total_input = sum(c["input_tokens"] for c in self.calls)
         total_output = sum(c["output_tokens"] for c in self.calls)
         total_tokens = sum(c["total_tokens"] for c in self.calls)
-
         total_cost = sum(self.calculate_cost(c) for c in self.calls)
 
         return {
@@ -57,17 +59,13 @@ class UsageTracker:
             "total_tokens": total_tokens,
             "total_cost_usd": round(total_cost, 6),
             "calls": [
-                {
-                    **c,
-                    "cost_usd": self.calculate_cost(c)
-                }
+                {**c, "cost_usd": self.calculate_cost(c)}
                 for c in self.calls
             ]
         }
 
     def print_detailed_report(self):
         summary = self.summary()
-
         print("\n========== OpenAI API Usage Report ==========")
         print(f"Execution started at (UTC): {summary['started_at']}")
         print(f"Total API calls: {summary['total_calls']}")
@@ -75,8 +73,8 @@ class UsageTracker:
         print(f"Total output tokens: {summary['total_output_tokens']}")
         print(f"Total tokens: {summary['total_tokens']}")
         print(f"Total estimated cost (USD): ${summary['total_cost_usd']}")
+        
         print("\n--- Per Call Breakdown ---")
-
         for i, c in enumerate(summary["calls"], start=1):
             print(
                 f"{i}. Stage: {c['stage']} | "
@@ -86,5 +84,4 @@ class UsageTracker:
                 f"Total: {c['total_tokens']} | "
                 f"Cost: ${c['cost_usd']}"
             )
-
         print("============================================\n")

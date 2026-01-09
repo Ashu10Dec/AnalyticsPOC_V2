@@ -1,6 +1,6 @@
 import json
 import os
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, redirect, url_for
 from openai import OpenAI
 from data_filter import filter_activities
 from usage_tracker import UsageTracker
@@ -9,7 +9,7 @@ from usage_tracker import UsageTracker
 app = Flask(__name__)
 JSON_DB_FILE = "Activity.json"
 HISTORY_FILE = "question_history.json"
-MODEL = "gpt-4.1-mini"
+MODEL = "gpt-4.1-mini" 
 
 # --- Load Database ---
 try:
@@ -24,10 +24,13 @@ usage_tracker = UsageTracker()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # --- Helper Functions ---
-def ask_question(question: str) -> str:
+def ask_question(question: str):
+    """
+    Returns a tuple: (answer_string, stats_dictionary)
+    """
     filtered = filter_activities(question, db)
     if not filtered:
-        return "Not available in the dataset."
+        return "Not available in the dataset.", None
 
     prompt = f"""
 You are a data analyst answering questions from a JSON dataset.
@@ -46,36 +49,30 @@ User Question:
 Provide a clear, factual answer.
 """
     try:
-        # Note: Adjust the API call based on your specific library version/provider
-        # The user's original code used client.responses.create (Perplexity/Special SDK?)
-        # Standard OpenAI is client.chat.completions.create
-        # I will stick to the user's syntax if it looks standard, but 'client.responses.create' is unusual for standard OpenAI python pkg.
-        # User imports 'from openai import OpenAI'. Standard usage is client.chat.completions.create.
-        # However, checking 'main.py' snippet: response = client.responses.create(...)
-        # This implies a specific SDK or maybe Perplexity's OpenAI-compatible endpoint with a specific method?
-        # OR it's a hallucination in the previous turn/user's code. 
-        # Actually, 'client.responses' doesn't exist in standard OpenAI SDK. 
-        # I will assume standard OpenAI chat completion for robustness, or try to match user's code.
-        # User's code: response = client.responses.create(model=MODEL, input=prompt)
-        # That looks like the Perplexity native API or a legacy/custom wrapper. 
-        # Let's assume standard OpenAI ChatCompletion for general compatibility unless user specifies otherwise.
-        # But wait, user's main.py has: from openai import OpenAI ... client = OpenAI()
-        # If they are using Perplexity via OpenAI client, it should be chat.completions.create.
-        # 'client.responses.create' suggests maybe they are using something else or it's a typo in their code.
-        # I'll convert it to standard chat.completions.create which works with Perplexity/OpenAI/Groq etc.
-
+        # standard OpenAI call
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}]
         )
         answer = response.choices[0].message.content
+        
+        # --- Usage Tracking ---
+        usage_tracker.record(response, MODEL, "query")
+        last_call = usage_tracker.calls[-1]
+        cost = usage_tracker.calculate_cost(last_call)
+        
+        stats = {
+            "model": MODEL,
+            "input_tokens": last_call["input_tokens"],
+            "output_tokens": last_call["output_tokens"],
+            "total_tokens": last_call["total_tokens"],
+            "cost": cost
+        }
 
-        # Mock usage tracking since the object structure differs
-        # usage_tracker.record(...) # simplified for deployment
-        return answer.strip()
+        return answer.strip(), stats
 
     except Exception as e:
-        return f"Error calling AI API: {str(e)}"
+        return f"Error calling AI API: {str(e)}", None
 
 # --- HTML Template ---
 HTML_TEMPLATE = """
@@ -84,35 +81,162 @@ HTML_TEMPLATE = """
 <head>
     <title>JSON Analytics Q&A</title>
     <style>
-        body { font-family: Segoe UI, Arial; background: #f4f6fa; margin: 0; padding: 0; display: flex; }
-        .sidebar { width: 260px; background: #0b1f3b; color: white; padding: 20px; height: 100vh; overflow-y: auto; }
-        .sidebar a { display: block; color: #dbe6ff; text-decoration: none; margin-bottom: 10px; font-size: 14px; }
-        .content { flex: 1; padding: 40px; }
-        .box { background: white; padding: 25px; border-radius: 8px; max-width: 900px; margin: auto; box-shadow: 0 4px 10px rgba(0,0,0,0.08); }
-        textarea { width: 100%; height: 90px; padding: 10px; }
-        button { background: #0b1f3b; color: white; padding: 10px 18px; border: none; cursor: pointer; margin-top: 10px;}
-        .answer { margin-top: 20px; white-space: pre-wrap; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: #f4f6fa; margin: 0; padding: 0; display: flex; height: 100vh; }
+        
+        /* Sidebar */
+        .sidebar { width: 280px; background: #0b1f3b; color: white; padding: 25px; overflow-y: auto; display: flex; flex-direction: column; }
+        .sidebar h3 { margin-top: 0; border-bottom: 1px solid #1e3a5f; padding-bottom: 15px; font-size: 16px; text-transform: uppercase; letter-spacing: 1px; color: #8ba9d0; }
+        .sidebar a { display: block; color: #dbe6ff; text-decoration: none; padding: 10px 12px; margin-bottom: 5px; font-size: 14px; border-radius: 4px; transition: background 0.2s; }
+        .sidebar a:hover { background: #1e3a5f; color: white; }
+        
+        /* Content Area */
+        .content { flex: 1; padding: 40px; overflow-y: auto; }
+        .box { background: white; padding: 35px; border-radius: 10px; max-width: 800px; margin: 0 auto; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
+        
+        /* Header with Loader */
+        .header-container { display: flex; align-items: center; gap: 15px; margin-bottom: 20px; }
+        h2 { margin: 0; color: #333; }
+        
+        /* Loader Spinner */
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #0b1f3b;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            display: none; /* Hidden by default */
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
+        /* Form Elements */
+        textarea { width: 100%; height: 100px; padding: 15px; border: 1px solid #ddd; border-radius: 6px; font-family: inherit; font-size: 15px; resize: vertical; box-sizing: border-box; }
+        textarea:focus { outline: none; border-color: #0b1f3b; }
+        
+        .button-group { margin-top: 15px; display: flex; gap: 10px; align-items: center; }
+        
+        button { background: #0b1f3b; color: white; padding: 10px 25px; border: none; border-radius: 5px; cursor: pointer; font-size: 15px; font-weight: 500; transition: background 0.2s; min-width: 100px;}
+        button:hover { background: #15335e; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        
+        .clear-btn { background: #ffcc80; color: #5a3a00; text-decoration: none; padding: 10px 25px; border-radius: 5px; font-size: 15px; font-weight: 500; display: inline-block; border: none; cursor: pointer; }
+        .clear-btn:hover { background: #ffb74d; }
+        
+        /* Answer Section */
+        .answer-box { margin-top: 30px; border-top: 2px solid #f0f0f0; padding-top: 20px; }
+        .answer-content { white-space: pre-wrap; line-height: 1.6; color: #2d3748; }
+        
+        /* Usage Stats */
+        .stats-box { margin-top: 20px; background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 15px; font-size: 13px; color: #555; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 15px; }
+        .stat-item { display: flex; flex-direction: column; }
+        .stat-label { font-weight: 600; color: #888; margin-bottom: 2px; text-transform: uppercase; font-size: 11px; }
+        .stat-value { font-family: monospace; font-size: 14px; color: #333; }
     </style>
+    <script>
+        // 1. Check for browser reload
+        if (window.performance) {
+            if (performance.navigation.type == 1) {
+                // Reload detected, redirect to clean home
+                window.location.href = "/";
+            }
+        }
+
+        function showLoader() {
+            document.getElementById('spinner').style.display = 'block';
+            
+            var answerBox = document.getElementById('answer-container');
+            if (answerBox) {
+                answerBox.style.display = 'none';
+            }
+
+            var btn = document.getElementById('askBtn');
+            btn.innerText = 'Processing...';
+            btn.disabled = true;
+        }
+
+        // 2. Attach logic to history links
+        document.addEventListener("DOMContentLoaded", function() {
+            var links = document.querySelectorAll('.sidebar a');
+            var textArea = document.querySelector('textarea[name="question"]');
+
+            links.forEach(function(link) {
+                link.addEventListener('click', function(e) {
+                    // Get text from link
+                    var questionText = this.innerText;
+                    
+                    // Update textarea INSTANTLY
+                    if(textArea) {
+                        textArea.value = questionText;
+                    }
+
+                    // Show loader (the browser will navigate away shortly after)
+                    showLoader();
+                });
+            });
+        });
+    </script>
 </head>
 <body>
+
 <div class="sidebar">
     <h3>History</h3>
     {% for q in history %}
         <a href="/?q={{ q }}">{{ q }}</a>
     {% endfor %}
 </div>
+
 <div class="content">
     <div class="box">
-        <h2>Ask a Question</h2>
-        <form method="post">
-            <textarea name="question" placeholder="Ask about the data...">{{ question }}</textarea><br>
-            <button type="submit">Ask</button>
+        <div class="header-container">
+            <h2>Ask a Question</h2>
+            <div id="spinner" class="loader"></div>
+        </div>
+        
+        <form method="post" action="/" onsubmit="showLoader()" autocomplete="off">
+            <!-- 3. Auto-select text on focus -->
+            <textarea name="question" placeholder="Ask about the project activities, budgets, or countries..." 
+                      required onfocus="this.select()" autocomplete="off">{{ question }}</textarea>
+            
+            <div class="button-group">
+                <button type="submit" id="askBtn">Ask Question</button>
+                <a href="/" class="clear-btn">Clear</a>
+            </div>
         </form>
+
         {% if answer %}
-        <div class="answer"><h3>Answer</h3><p>{{ answer }}</p></div>
+        <div id="answer-container" class="answer-box">
+            <h3>Answer</h3>
+            <div class="answer-content">{{ answer }}</div>
+            
+            {% if stats %}
+            <div class="stats-box">
+                <div class="stat-item">
+                    <span class="stat-label">Model</span>
+                    <span class="stat-value">{{ stats.model }}</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Input Tokens</span>
+                    <span class="stat-value">{{ stats.input_tokens }}</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Output Tokens</span>
+                    <span class="stat-value">{{ stats.output_tokens }}</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Total Tokens</span>
+                    <span class="stat-value">{{ stats.total_tokens }}</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Est. Cost</span>
+                    <span class="stat-value" style="color: green;">${{ stats.cost }}</span>
+                </div>
+            </div>
+            {% endif %}
+        </div>
         {% endif %}
     </div>
 </div>
+
 </body>
 </html>
 """
@@ -120,7 +244,7 @@ HTML_TEMPLATE = """
 # --- Routes ---
 @app.route("/", methods=["GET", "POST"])
 def home():
-    # Load History
+    # 1. Load History
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r") as f:
@@ -130,32 +254,36 @@ def home():
         question_history = []
 
     answer = None
+    stats = None
     question = ""
 
-    # Handle Link Click
-    if request.args.get("q"):
-        question = request.args.get("q")
-        answer = ask_question(question)
-
-    # Handle Form Submit
-    elif request.method == "POST":
+    # 2. Logic
+    if request.method == "POST":
         question = request.form.get("question", "").strip()
         if question:
-            if question in question_history: question_history.remove(question)
+            # Update history
+            if question in question_history: 
+                question_history.remove(question)
             question_history.append(question)
             question_history = question_history[-10:] # Keep last 10
-
+            
             with open(HISTORY_FILE, "w") as f:
                 json.dump(question_history, f)
+            
+            # Get Answer & Stats
+            answer, stats = ask_question(question)
 
-            answer = ask_question(question)
+    elif request.args.get("q"):
+        question = request.args.get("q")
+        answer, stats = ask_question(question)
 
     return render_template_string(
         HTML_TEMPLATE,
         question=question,
         answer=answer,
+        stats=stats,
         history=reversed(question_history)
     )
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, port=5000)
