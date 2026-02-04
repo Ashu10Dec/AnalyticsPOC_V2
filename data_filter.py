@@ -11,6 +11,7 @@ def filter_activities(question: str, db: list):
     if "in progress" in q:
         return [a for a in db if a.get("ActivityStatus") == "In progress"]
 
+
     # --- Country filter ---
     for country in ["ghana", "nigeria", "kenya", "south africa"]:
         if country in q:
@@ -30,4 +31,4 @@ def filter_activities(question: str, db: list):
         ]
 
     # --- Fallback: cap dataset ---
-    return db[:10]   # safety cap
+    return db[:50]   # safety cap

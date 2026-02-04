@@ -2,14 +2,30 @@ import json
 import os
 from flask import Flask, request, render_template_string, redirect, url_for
 from openai import OpenAI
+from anthropic import Anthropic
 from data_filter import filter_activities
 from usage_tracker import UsageTracker
+
+# Load environment variables from .env file (add this)
+from dotenv import load_dotenv
+load_dotenv()
 
 # --- Configuration ---
 app = Flask(__name__)
 JSON_DB_FILE = "Activity.json"
 HISTORY_FILE = "question_history.json"
-MODEL = "gpt-4.1-mini" 
+
+# Available models
+AVAILABLE_MODELS = {
+    "gpt-4.1-mini": {"provider": "openai", "display": "GPT-4.1 Mini"},
+    "gpt-4.1": {"provider": "openai", "display": "GPT-4.1"},
+    "gpt-5-mini": {"provider": "openai", "display": "GPT-5 Mini"},
+    "claude-3-haiku-20240307": {"provider": "claude", "display": "Claude 3 Haiku"},
+    "claude-sonnet-4-5-20250929": {"provider": "claude", "display": "Claude Sonnet 4.5"},
+}
+
+# Default model
+DEFAULT_MODEL = "gpt-4.1-mini"
 
 # --- Load Database ---
 try:
@@ -21,14 +37,23 @@ except FileNotFoundError:
 
 # --- Initialize Services ---
 usage_tracker = UsageTracker()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Initialize API clients
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+claude_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+
+print("OPENAI_API_KEY:", bool(os.getenv("OPENAI_API_KEY")))
+print("ANTHROPIC_API_KEY:", bool(os.getenv("ANTHROPIC_API_KEY")))
+
 
 # --- Helper Functions ---
-def ask_question(question: str):
+def ask_question(question: str, model_name: str):
     """
     Returns a tuple: (answer_string, stats_dictionary)
     """
     filtered = filter_activities(question, db)
+
     if not filtered:
         return "Not available in the dataset.", None
 
@@ -43,26 +68,43 @@ Rules:
 Relevant Records:
 {json.dumps(filtered, ensure_ascii=False)}
 
-User Question:
-{question}
+User Question: {question}
 
 Provide a clear, factual answer.
 """
+
     try:
-        # standard OpenAI call
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        answer = response.choices[0].message.content
+        model_info = AVAILABLE_MODELS[model_name]
+        provider = model_info["provider"]
         
+        if provider == "openai":
+            # OpenAI call
+            response = openai_client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            answer = response.choices[0].message.content
+
+        elif provider == "claude":
+            # Claude call
+            response = claude_client.messages.create(
+                model=model_name,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            answer = response.content[0].text
+        else:
+            return "Invalid LLM provider configuration.", None
+
         # --- Usage Tracking ---
-        usage_tracker.record(response, MODEL, "query")
+        usage_tracker.record(response, model_name, "query", provider)
         last_call = usage_tracker.calls[-1]
         cost = usage_tracker.calculate_cost(last_call)
-        
+
         stats = {
-            "model": MODEL,
+            "provider": provider,
+            "model": model_name,
+            "display_name": model_info["display"],
             "input_tokens": last_call["input_tokens"],
             "output_tokens": last_call["output_tokens"],
             "total_tokens": last_call["total_tokens"],
@@ -109,6 +151,51 @@ HTML_TEMPLATE = """
         }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         
+        /* Model Selector */
+        .model-selector {
+            margin-bottom: 15px;
+            padding: 12px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            border: 1px solid #e9ecef;
+        }
+        .model-label {
+            font-size: 11px;
+            font-weight: 600;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+            display: block;
+        }
+        .model-buttons {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+        .model-btn {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            background: #e8e8e8;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 500;
+            transition: all 0.2s;
+            color: #5a3a00;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.15), inset 0 1px 0 rgba(255,255,255,0.6);
+        }
+        .model-btn:hover {
+            background: #fff3e0;
+            transform: translateY(-1px);
+            box-shadow: 0 3px 6px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.6);
+        }
+        .model-btn.active {
+            background: #ffcc80;
+            color: #5a3a00;
+            box-shadow: inset 0 2px 5px rgba(0,0,0,0.25);
+        }
+        
         /* Form Elements */
         textarea { width: 100%; height: 100px; padding: 15px; border: 1px solid #ddd; border-radius: 6px; font-family: inherit; font-size: 15px; resize: vertical; box-sizing: border-box; }
         textarea:focus { outline: none; border-color: #0b1f3b; }
@@ -133,6 +220,9 @@ HTML_TEMPLATE = """
         .stat-value { font-family: monospace; font-size: 14px; color: #333; }
     </style>
     <script>
+        // Store selected model in localStorage
+        let selectedModel = localStorage.getItem('selectedModel') || '{{ default_model }}';
+        
         // 1. Check for browser reload
         if (window.performance) {
             if (performance.navigation.type == 1) {
@@ -153,14 +243,32 @@ HTML_TEMPLATE = """
             btn.innerText = 'Processing...';
             btn.disabled = true;
         }
+        
+        function selectModel(modelName) {
+            selectedModel = modelName;
+            localStorage.setItem('selectedModel', modelName);
+            document.getElementById('selected_model').value = modelName;
+            
+            // Update button states
+            document.querySelectorAll('.model-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.querySelector(`[data-model="${modelName}"]`).classList.add('active');
+        }
 
         // 2. Attach logic to history links
         document.addEventListener("DOMContentLoaded", function() {
+            // Set initial model selection
+            document.getElementById('selected_model').value = selectedModel;
+            document.querySelector(`[data-model="${selectedModel}"]`).classList.add('active');
+            
             var links = document.querySelectorAll('.sidebar a');
             var textArea = document.querySelector('textarea[name="question"]');
 
             links.forEach(function(link) {
                 link.addEventListener('click', function(e) {
+                    e.preventDefault(); // Prevent default navigation
+                    
                     // Get text from link
                     var questionText = this.innerText;
                     
@@ -169,8 +277,12 @@ HTML_TEMPLATE = """
                         textArea.value = questionText;
                     }
 
-                    // Show loader (the browser will navigate away shortly after)
+                    // Show loader
                     showLoader();
+                    
+                    // Submit form with current selected model
+                    var form = document.querySelector('form');
+                    form.submit();
                 });
             });
         });
@@ -192,7 +304,24 @@ HTML_TEMPLATE = """
             <div id="spinner" class="loader"></div>
         </div>
         
+        <!-- Model Selector -->
+        <div class="model-selector">
+            <span class="model-label">Select Model</span>
+            <div class="model-buttons">
+                {% for model_key, model_info in models.items() %}
+                    <button type="button" 
+                            class="model-btn" 
+                            data-model="{{ model_key }}"
+                            onclick="selectModel('{{ model_key }}')">
+                        {{ model_info.display }}
+                    </button>
+                {% endfor %}
+            </div>
+        </div>
+        
         <form method="post" action="/" onsubmit="showLoader()" autocomplete="off">
+            <input type="hidden" name="selected_model" id="selected_model" value="{{ selected_model }}">
+            
             <!-- 3. Auto-select text on focus -->
             <textarea name="question" placeholder="Ask about the project activities, budgets, or countries..." 
                       required onfocus="this.select()" autocomplete="off">{{ question }}</textarea>
@@ -212,7 +341,7 @@ HTML_TEMPLATE = """
             <div class="stats-box">
                 <div class="stat-item">
                     <span class="stat-label">Model</span>
-                    <span class="stat-value">{{ stats.model }}</span>
+                    <span class="stat-value">{{ stats.display_name }}</span>
                 </div>
                 <div class="stat-item">
                     <span class="stat-label">Input Tokens</span>
@@ -256,10 +385,13 @@ def home():
     answer = None
     stats = None
     question = ""
+    selected_model = DEFAULT_MODEL
 
     # 2. Logic
     if request.method == "POST":
         question = request.form.get("question", "").strip()
+        selected_model = request.form.get("selected_model", DEFAULT_MODEL)
+        
         if question:
             # Update history
             if question in question_history: 
@@ -271,18 +403,21 @@ def home():
                 json.dump(question_history, f)
             
             # Get Answer & Stats
-            answer, stats = ask_question(question)
+            answer, stats = ask_question(question, selected_model)
 
     elif request.args.get("q"):
         question = request.args.get("q")
-        answer, stats = ask_question(question)
+        answer, stats = ask_question(question, DEFAULT_MODEL)
 
     return render_template_string(
         HTML_TEMPLATE,
         question=question,
         answer=answer,
         stats=stats,
-        history=reversed(question_history)
+        history=reversed(question_history),
+        models=AVAILABLE_MODELS,
+        default_model=DEFAULT_MODEL,
+        selected_model=selected_model
     )
 
 if __name__ == "__main__":
